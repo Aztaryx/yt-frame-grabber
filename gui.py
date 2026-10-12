@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 
@@ -192,6 +193,14 @@ class Button:
         self.visible = True
 
 
+@dataclass
+class HistoryEntry:
+    url: str
+    ranges: str
+    out_dir: Path
+    frames: list[backend.Frame]
+
+
 # ---- app ------------------------------------------------------------------
 class App:
     def __init__(self, url: str = "", rng: str = ""):
@@ -220,6 +229,8 @@ class App:
             "delete": Button("Delete selected", self.delete_selected, toolbar=True),
             "keep": Button("Keep selected", self.keep_selected, toolbar=True),
             "open": Button("Open folder", self.do_open, toolbar=True),
+            "history": Button("History", self.toggle_history),
+            "undo": Button("Undo delete", self.undo_delete, toolbar=True),
         }
         self.L: dict[str, pygame.Rect] = {}
 
@@ -231,6 +242,10 @@ class App:
         self.info: backend.VideoInfo | None = None
         self.frames: list[backend.Frame] = []
         self.out_dir: Path | None = None
+        self.history: list[HistoryEntry] = []
+        self.history_open = False
+        self.undo_stack: list[list[tuple[backend.Frame, Path | None, Path | None]]] = []
+        self.close_prompt = False
 
         self.status = "Paste a link and one or more time ranges, then hit Extract."
         self.status_kind = "info"
@@ -247,6 +262,7 @@ class App:
         self._pv = None
 
         self.tmp = Path(tempfile.mkdtemp(prefix="ytframes_"))
+        self.trash = self.tmp / "deleted"
         atexit.register(shutil.rmtree, self.tmp, True)
 
     # ---- status / background jobs ------------------------------------------
@@ -377,6 +393,19 @@ class App:
         self.scroll = 0
         self.anchor = None
         self.preview = None
+        snapshot = [
+            backend.Frame(f.index, f.path, f.thumb, f.t, False)
+            for f in frames
+        ]
+        self.history = [
+            entry for entry in self.history
+            if entry.out_dir != out_dir
+        ]
+        self.history.insert(0, HistoryEntry(
+            self.url_field.text.strip(), self.range_field.text,
+            out_dir, snapshot,
+        ))
+        self.history = self.history[:20]
         self.set_status(
             f"{len(frames)} frames -> {out_dir.name}   |   click/drag: select, "
             "shift-click: range, right-click: preview", "ok")
@@ -396,7 +425,30 @@ class App:
     def _remove(self, doomed: list[backend.Frame], verb: str) -> None:
         if not doomed:
             return
-        backend.delete_frames(doomed)
+        self.trash.mkdir(parents=True, exist_ok=True)
+        moved: list[tuple[backend.Frame, Path | None, Path | None]] = []
+        try:
+            for f in doomed:
+                saved_path: Path | None = None
+                saved_thumb: Path | None = None
+                for path in (f.path, f.thumb):
+                    if path.exists():
+                        target = self.trash / f"{len(moved):06d}_{path.name}"
+                        shutil.move(str(path), str(target))
+                        if path == f.path:
+                            saved_path = target
+                        else:
+                            saved_thumb = target
+                moved.append((f, saved_path, saved_thumb))
+        except OSError as e:
+            for frame, path, thumb in moved:
+                if path is not None and path.exists():
+                    shutil.move(str(path), str(frame.path))
+                if thumb is not None and thumb.exists():
+                    shutil.move(str(thumb), str(frame.thumb))
+            self.set_status(f"Couldn't delete frames: {short_err(e)}", "error")
+            return
+        self.undo_stack.append(moved)
         gone = {id(f) for f in doomed}
         self.frames = [f for f in self.frames if id(f) not in gone]
         for f in doomed:
@@ -413,6 +465,43 @@ class App:
         if any(f.selected for f in self.frames):
             self._remove([f for f in self.frames if not f.selected], "Removed")
 
+    def undo_delete(self) -> None:
+        if not self.undo_stack:
+            return
+        restored = self.undo_stack.pop()
+        for f, path, thumb in restored:
+            if path is not None and path.exists():
+                f.path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(f.path))
+            if thumb is not None and thumb.exists():
+                f.thumb.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(thumb), str(f.thumb))
+            if f not in self.frames:
+                self.frames.append(f)
+        self.frames.sort(key=lambda f: f.index)
+        self.select_none()
+        self.set_status(f"Restored {len(restored)} frames.", "ok")
+
+    def toggle_history(self) -> None:
+        self.history_open = not self.history_open
+
+    def load_history(self, entry: HistoryEntry) -> None:
+        available = [
+            backend.Frame(f.index, f.path, f.thumb, f.t, False)
+            for f in entry.frames
+            if f.path.exists() and f.thumb.exists()
+        ]
+        if not available:
+            self.set_status("That history entry no longer has frames on disk.", "error")
+            return
+        self.url_field.set(entry.url)
+        self.range_field.set(entry.ranges)
+        self.info = self.info if self.info and self.info.url == entry.url else None
+        self.history_open = False
+        self.load_frames(available, entry.out_dir)
+        self.set_status(
+            f"Reopened {len(available)} saved frames from {entry.out_dir.name}.", "ok")
+
     def do_open(self) -> None:
         if self.out_dir:
             open_folder(self.out_dir)
@@ -428,10 +517,13 @@ class App:
 
         self.L["url"] = pygame.Rect(76, 14, bx - 12 - 76, 34)
         self.L["range"] = pygame.Rect(76, 58, 300, 34)
+        self.L["history"] = pygame.Rect(390, 58, 100, 34)
+        self.btn["undo"].rect = pygame.Rect(498, 58, 120, 34)
         self.url_field.rect = self.L["url"]
         self.range_field.rect = self.L["range"]
         self.btn["fetch"].rect = pygame.Rect(bx, 14, bw, 34)
         self.btn["go"].rect = pygame.Rect(bx, 58, bw, 34)
+        self.btn["history"].rect = self.L["history"]
         self.L["grid"] = pygame.Rect(0, GRID_TOP, w, max(0, h - GRID_TOP - tb_h))
         self.L["toolbar"] = pygame.Rect(0, h - tb_h, w, tb_h)
 
@@ -452,6 +544,8 @@ class App:
         self.btn["delete"].enabled = n_sel > 0
         self.btn["keep"].enabled = n_sel > 0
         self.btn["none"].enabled = n_sel > 0
+        self.btn["undo"].visible = bool(self.undo_stack)
+        self.btn["undo"].enabled = bool(self.undo_stack)
 
     # ---- events ----------------------------------------------------------------
     def cell_at(self, pos) -> int | None:
@@ -469,6 +563,26 @@ class App:
     def handle(self, e: pygame.event.Event) -> None:
         if self.preview is not None:
             self.handle_preview(e)
+            return
+
+        if self.close_prompt:
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                yes, no = self.close_prompt_rects()
+                if yes.collidepoint(e.pos):
+                    self.close_prompt = False
+                    self._closing = True
+                elif no.collidepoint(e.pos):
+                    self.close_prompt = False
+            return
+
+        if self.history_open:
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                for i, entry in enumerate(self.history):
+                    if self.history_rect(i).collidepoint(e.pos):
+                        self.load_history(entry)
+                        return
+                if not self.history_panel().collidepoint(e.pos):
+                    self.history_open = False
             return
 
         if e.type == pygame.MOUSEBUTTONDOWN:
@@ -699,7 +813,7 @@ class App:
         self.url_field.draw(s, self.font)
         self.range_field.draw(s, self.font)
         self.text("Separate ranges with commas, semicolons, or new lines",
-                  (self.L["range"].right + 14, 66), self.small, DIM)
+                  (self.L["history"].right + 14, 66), self.small, DIM)
         for b in self.btn.values():
             self.draw_button(b)
 
@@ -728,20 +842,89 @@ class App:
             for name in ("all", "none", "invert", "delete", "keep", "open"):
                 self.draw_button(self.btn[name])
 
+        if self.history_open:
+            self.draw_history()
+        if self.close_prompt:
+            self.draw_close_prompt()
+
+    def history_panel(self) -> pygame.Rect:
+        w, h = self.screen.get_size()
+        return pygame.Rect(380, 96, min(620, w - 396), min(430, h - 112))
+
+    def history_rect(self, index: int) -> pygame.Rect:
+        panel = self.history_panel()
+        return pygame.Rect(panel.x + 12, panel.y + 42 + index * 38,
+                           panel.w - 24, 32)
+
+    def draw_history(self) -> None:
+        panel = self.history_panel()
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=8)
+        pygame.draw.rect(self.screen, BORDER, panel, 1, border_radius=8)
+        self.text("Recent extractions", (panel.x + 14, panel.y + 12), self.font)
+        if not self.history:
+            self.text("No saved extraction history yet.", (panel.x + 14, panel.y + 52),
+                      self.small, DIM)
+            return
+        prev = self.screen.get_clip()
+        self.screen.set_clip(panel)
+        for i, entry in enumerate(self.history):
+            rect = self.history_rect(i)
+            hover = rect.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(self.screen, BTN_HOVER if hover else BTN, rect,
+                             border_radius=5)
+            label = f"{entry.out_dir.name}  ({len(entry.frames)} frames)"
+            self.text(fit(self.small, label, rect.w - 16),
+                      (rect.x + 8, rect.y + 8), self.small)
+        self.screen.set_clip(prev)
+
+    def close_prompt_rects(self) -> tuple[pygame.Rect, pygame.Rect]:
+        w, h = self.screen.get_size()
+        box = pygame.Rect(w // 2 - 280, h // 2 - 90, 560, 180)
+        return (
+            pygame.Rect(box.x + 120, box.bottom - 52, 130, 34),
+            pygame.Rect(box.x + 310, box.bottom - 52, 130, 34),
+        )
+
+    def draw_close_prompt(self) -> None:
+        w, h = self.screen.get_size()
+        shade = pygame.Surface((w, h), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 150))
+        self.screen.blit(shade, (0, 0))
+        box = pygame.Rect(w // 2 - 280, h // 2 - 90, 560, 180)
+        pygame.draw.rect(self.screen, PANEL, box, border_radius=8)
+        pygame.draw.rect(self.screen, BORDER, box, 1, border_radius=8)
+        self.text("Close YT Frame Grabber?", (box.x + 22, box.y + 20), self.font)
+        self.text("The current frame set is still being extracted or has missing files.",
+                  (box.x + 22, box.y + 58), self.small, DIM)
+        self.text("Cancel extraction first, or keep the window open to finish.",
+                  (box.x + 22, box.y + 78), self.small, DIM)
+        yes, no = self.close_prompt_rects()
+        for rect, label in ((yes, "Close anyway"), (no, "Keep open")):
+            pygame.draw.rect(self.screen, BTN_HOVER if rect.collidepoint(
+                pygame.mouse.get_pos()) else BTN, rect, border_radius=6)
+            self.screen.blit(self.small.render(label, True, TEXT),
+                             self.small.render(label, True, TEXT).get_rect(center=rect.center))
+
     # ---- main loop -------------------------------------------------------------
     def run(self) -> None:
         clock = pygame.time.Clock()
         running = True
+        self._closing = False
         while running:
             self.layout()
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
-                    running = False
+                    if self.busy or self.frames and any(not f.path.exists() for f in self.frames):
+                        self.close_prompt = True
+                    else:
+                        running = False
                 else:
                     self.handle(e)
             self.drain()
             self.draw()
             pygame.display.flip()
             clock.tick(60)
+            if self._closing:
+                running = False
         self.cancel.set()
         pygame.quit()

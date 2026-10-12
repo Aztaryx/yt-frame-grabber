@@ -26,7 +26,12 @@ Optionally pre-fill: `python main.py "https://youtu.be/XXXX" "1:27.250-1:28"`
 | Select a run | click one, **shift-click** another |
 | Preview full-res | **right-click** (then ←/→, Space to select, Esc to close) |
 | Remove or keep | **Delete selected** / **Keep selected** (deletes everything else) |
+| Reopen a previous extraction | **History**, then click an entry (saved frames are reused without re-extracting) |
+| Undo a removal | **Undo delete** (available for the current session) |
 | Cancel a download/extraction | **Cancel** button or Esc |
+
+Closing while an extraction is running, or while the current grid has missing image files,
+shows a confirmation first. Completed extractions are already saved in the output directory.
 
 Output goes to `output/<Video Title> [id]_<start>-<end>/` for one range, or a
 `multiple-ranges` directory for multiple ranges. Files are named
