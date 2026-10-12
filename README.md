@@ -1,6 +1,6 @@
 # YT Frame Grabber
 
-Paste a YouTube link, type a time range, get **every frame** in that range as
+Paste a YouTube link, type one or more time ranges, get **every frame** in those ranges as
 full-resolution PNGs. Pick which to keep in a simple grid.
 
 ## Setup
@@ -14,8 +14,10 @@ Optionally pre-fill: `python main.py "https://youtu.be/XXXX" "1:27.250-1:28"`
 ## Usage
 
 1. Paste the link, press **Enter** (or **Fetch**). Shows the best available stream: resolution, fps, codec, duration, frame count.
-2. Type a range and press **Enter** (or **Extract**). Anything works down to the millisecond:
-   `87-88` · `87.5-88.25` · `1:27-1:28` · `1:27.250-1:28` · `0:01:27.250 to 0:01:28`
+2. Type one or more ranges and press **Enter** (or **Extract**). Separate ranges
+   with commas, semicolons, or new lines. Anything works down to the millisecond:
+   `87-88` · `87.5-88.25` · `1:27-1:28` · `1:27.250-1:28` ·
+   `87-88, 100-101` · `0:01:27.250 to 0:01:28`
 3. Frames appear in a grid.
 
 | Action | How |
@@ -26,7 +28,8 @@ Optionally pre-fill: `python main.py "https://youtu.be/XXXX" "1:27.250-1:28"`
 | Remove or keep | **Delete selected** / **Keep selected** (deletes everything else) |
 | Cancel a download/extraction | **Cancel** button or Esc |
 
-Output goes to `output/<Video Title> [id]_<start>-<end>/`, files named
+Output goes to `output/<Video Title> [id]_<start>-<end>/` for one range, or a
+`multiple-ranges` directory for multiple ranges. Files are named
 `000000_87.000s.png` (index + exact timestamp in the video).
 
 ## Notes

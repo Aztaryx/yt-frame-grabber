@@ -5,6 +5,7 @@ Accepted timestamps (all down to the millisecond and beyond):
     1:27      1:27.250    0:01:27.250
 Accepted range separators:  -   –   —   to
     87-88    1:27.250-1:28    87.5 to 88.25
+Multiple ranges can be separated with commas, semicolons, or newlines.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ class TimeParseError(ValueError):
 
 _NUM = re.compile(r"^(?:\d+(?:\.\d*)?|\.\d+)$")
 _RANGE_SEP = re.compile(r"\s*(?:-|–|—|\bto\b)\s*", re.IGNORECASE)
+_MULTI_RANGE_SEP = re.compile(r"[,;\n]")
 
 
 def parse_time(text: str) -> float:
@@ -48,6 +50,16 @@ def parse_range(text: str) -> tuple[float, float]:
     if end <= start:
         raise TimeParseError("End must be after start")
     return start, end
+
+
+def parse_ranges(text: str) -> list[tuple[float, float]]:
+    """Parse one or more ranges separated by commas, semicolons, or newlines."""
+    cleaned = text.strip()
+    if (not cleaned
+            or re.search(r"[,;]\s*(?:[,;]|\Z)", cleaned)):
+        raise TimeParseError("Enter at least one time range")
+    parts = [part for part in _MULTI_RANGE_SEP.split(cleaned) if part.strip()]
+    return [parse_range(part) for part in parts]
 
 
 def fmt_dur(seconds: float) -> str:

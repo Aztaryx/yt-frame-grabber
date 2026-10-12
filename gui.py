@@ -1,4 +1,4 @@
-"""pygame front-end: URL + range in, selectable frame grid out."""
+"""pygame front-end: URL + ranges in, selectable frame grid out."""
 from __future__ import annotations
 
 import atexit
@@ -79,11 +79,12 @@ def open_folder(path: Path) -> None:
 
 # ---- widgets --------------------------------------------------------------
 class TextField:
-    def __init__(self, hint: str = ""):
+    def __init__(self, hint: str = "", normalize_newlines: bool = False):
         self.text = ""
         self.cur = 0
         self.focus = False
         self.hint = hint
+        self.normalize_newlines = normalize_newlines
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.all = False      # "select all" state
         self._off = 0
@@ -93,7 +94,11 @@ class TextField:
         self.text, self.cur, self.all = s, len(s), False
 
     def insert(self, s: str) -> None:
-        s = s.replace("\r", "").replace("\n", "")
+        s = s.replace("\r", "")
+        if self.normalize_newlines:
+            s = s.replace("\n", ", ")
+        else:
+            s = s.replace("\n", "")
         if not s:
             return
         if self.all:
@@ -199,7 +204,9 @@ class App:
         self.small = pygame.font.SysFont(names, 14)
 
         self.url_field = TextField("Paste a YouTube link")
-        self.range_field = TextField("e.g.  87-88.5   or   1:27.250-1:28")
+        self.range_field = TextField(
+            "e.g.  87-88.5, 100-101", normalize_newlines=True
+        )
         self.url_field.set(url)
         self.range_field.set(rng)
         self.url_field.focus = True
@@ -225,7 +232,7 @@ class App:
         self.frames: list[backend.Frame] = []
         self.out_dir: Path | None = None
 
-        self.status = "Paste a link and a time range, then hit Extract."
+        self.status = "Paste a link and one or more time ranges, then hit Extract."
         self.status_kind = "info"
 
         self.scroll = 0
@@ -304,7 +311,7 @@ class App:
             self._progress(None, "Fetching video info...")
             info = backend.fetch_info(url)
             self.q.put(("info", info))
-            self.q.put(("status", "Got it. Enter a time range and hit Extract.", "ok"))
+            self.q.put(("status", "Got it. Enter one or more ranges and hit Extract.", "ok"))
             self.q.put(("focus_range",))
 
         self._run(job)
@@ -324,7 +331,7 @@ class App:
             self.set_status("Paste a link first.", "error")
             return
         try:
-            start, end = timeparse.parse_range(self.range_field.text)
+            ranges = timeparse.parse_ranges(self.range_field.text)
         except timeparse.TimeParseError as e:
             self.set_status(str(e), "error")
             return
@@ -336,19 +343,29 @@ class App:
                 self._progress(None, "Fetching video info...")
                 info = backend.fetch_info(url)
                 self.q.put(("info", info))
-            if info.duration and start >= info.duration:
-                raise ValueError(f"Start is past the end of the video "
-                                 f"({timeparse.fmt_dur(info.duration)}).")
-            stop = min(end, info.duration) if info.duration else end
+            bounded = []
+            for start, end in ranges:
+                if info.duration and start >= info.duration:
+                    raise ValueError(
+                        f"Start is past the end of the video "
+                        f"({timeparse.fmt_dur(info.duration)})."
+                    )
+                bounded.append((start, min(end, info.duration))
+                               if info.duration else (start, end))
 
             src = backend.ensure_downloaded(info, self._progress, self.cancel)
             self.q.put(("info", info))   # refresh with exact frame count
 
-            out_dir = backend.make_output_dir(info, start, stop)
+            out_dir = (backend.make_output_dir(info, *bounded[0])
+                       if len(bounded) == 1
+                       else backend.make_multi_output_dir(info))
             thumb_dir = self.tmp / out_dir.name
-            expected = round(info.fps * (stop - start)) if info.fps else 0
-            frames = backend.extract_frames(src, start, stop, out_dir, thumb_dir,
-                                            expected, self._progress, self.cancel)
+            expected = (round(info.fps * sum(end - start for start, end in bounded))
+                        if info.fps else 0)
+            frames = backend.extract_ranges(
+                src, bounded, out_dir, thumb_dir, expected,
+                self._progress, self.cancel,
+            )
             self.q.put(("frames", frames, out_dir))
 
         self._run(job)
@@ -678,10 +695,10 @@ class App:
         s.fill(BG)
 
         self.text("URL", (16, 21), self.font, DIM)
-        self.text("Range", (16, 65), self.font, DIM)
+        self.text("Ranges", (16, 65), self.font, DIM)
         self.url_field.draw(s, self.font)
         self.range_field.draw(s, self.font)
-        self.text("start-end, e.g. 87-88.5 or 1:27.250-1:28",
+        self.text("Separate ranges with commas, semicolons, or new lines",
                   (self.L["range"].right + 14, 66), self.small, DIM)
         for b in self.btn.values():
             self.draw_button(b)

@@ -1,4 +1,4 @@
-"""YT Frame Grabber: paste a YouTube link, pick a time range, get every frame.
+"""YT Frame Grabber: paste a YouTube link, pick time ranges, get every frame.
 
     python main.py
     python main.py "https://youtu.be/XXXX" "1:27.250-1:28"

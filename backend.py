@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -216,6 +217,17 @@ def make_output_dir(info: VideoInfo, start: float, end: float) -> Path:
     return d
 
 
+def make_multi_output_dir(info: VideoInfo) -> Path:
+    """Create a distinct output directory for an extraction with many ranges."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    base = f"{_safe_name(info.title)} [{info.id}]_multiple-ranges"
+    d, n = OUTPUT_DIR / base, 2
+    while d.exists():
+        d = OUTPUT_DIR / f"{base} ({n})"
+        n += 1
+    return d
+
+
 def extract_frames(src: Path, start: float, end: float, out_dir: Path,
                    thumb_dir: Path, expected: int, progress: Progress,
                    cancel: threading.Event) -> list[Frame]:
@@ -291,6 +303,59 @@ def extract_frames(src: Path, start: float, end: float, out_dir: Path,
             path = named
         frames.append(Frame(index=i, path=path, thumb=thumbs[i], t=t))
     return frames
+
+
+def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
+                   thumb_dir: Path, expected: int, progress: Progress,
+                   cancel: threading.Event) -> list[Frame]:
+    """Extract several ranges into one ordered frame collection."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    total_duration = sum(end - start for start, end in ranges)
+    total_expected = expected
+    all_frames: list[Frame] = []
+    try:
+        for range_index, (start, end) in enumerate(ranges, 1):
+            if cancel.is_set():
+                raise Cancelled()
+            segment_out = Path(tempfile.mkdtemp(prefix="frames_", dir=thumb_dir))
+            segment_thumb = Path(tempfile.mkdtemp(prefix="thumbs_", dir=thumb_dir))
+            segment_expected = (
+                round(expected * (end - start) / total_duration)
+                if expected and total_duration else 0
+            )
+
+            def segment_progress(frac, text, offset=len(all_frames)):
+                if frac is None or not total_expected:
+                    progress(None, f"Range {range_index}/{len(ranges)}: {text}")
+                else:
+                    progress(
+                        min((offset + frac * segment_expected) / total_expected, 1.0),
+                        f"Range {range_index}/{len(ranges)}: {text}",
+                    )
+
+            frames = extract_frames(
+                src, start, end, segment_out, segment_thumb,
+                segment_expected, segment_progress, cancel,
+            )
+            for frame in frames:
+                index = len(all_frames)
+                suffix = f"_{frame.t:.3f}s" if frame.t is not None else ""
+                path = out_dir / f"{index:06d}{suffix}.png"
+                thumb = thumb_dir / f"{index:06d}.jpg"
+                shutil.move(str(frame.path), path)
+                shutil.move(str(frame.thumb), thumb)
+                all_frames.append(Frame(index, path, thumb, frame.t))
+            shutil.rmtree(segment_out, ignore_errors=True)
+            shutil.rmtree(segment_thumb, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(thumb_dir, ignore_errors=True)
+        raise
+
+    if not all_frames:
+        raise RuntimeError("No frames in the requested ranges")
+    return all_frames
 
 
 def delete_frames(frames: list[Frame]) -> None:
