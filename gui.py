@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
@@ -36,7 +37,10 @@ OK = (100, 200, 130)
 ERR = (240, 100, 100)
 
 CELL_W, CELL_H = 208, 150
-THUMB_W, THUMB_H = 192, 108
+THUMB_W, THUMB_H = backend.THUMB_W, backend.THUMB_H   # thumbnails are pre-sized by ffmpeg
+THUMB_CACHE_MAX = 1200       # decoded thumbnails kept in RAM (~80 KB each)
+LOAD_BUDGET_MS = 8           # max time spent decoding thumbnails per frame
+LABEL_CACHE_MAX = 4000       # rendered "#123" / "1.234s" text surfaces
 GRID_TOP = 168
 TOOLBAR_H = 52
 
@@ -252,8 +256,11 @@ class App:
 
         self.scroll = 0
         self.geom = (0, 1)
-        self.thumbs: dict[int, pygame.Surface] = {}
-        self.loads_left = 0
+        self.thumbs: OrderedDict[int, pygame.Surface] = OrderedDict()   # LRU
+        self.load_t0 = 0
+        self.loads_this_frame = 0
+        self.label_cache: dict[tuple, pygame.Surface] = {}
+        self.n_sel = 0
         self.anchor: int | None = None
         self.dragging = False
         self.drag_state = True
@@ -262,8 +269,13 @@ class App:
         self._pv = None
 
         self.tmp = Path(tempfile.mkdtemp(prefix="ytframes_"))
-        self.trash = self.tmp / "deleted"
+        self.trash = self.tmp / "deleted"            # thumbnails of removed frames
+        # Full-res PNGs of removed frames are parked next to the output folder
+        # (same drive) so a delete is a rename, not a multi-GB cross-drive copy.
+        self.trash_png = backend.OUTPUT_DIR / f".trash-{os.getpid()}"
+        self._trash_seq = 0
         atexit.register(shutil.rmtree, self.tmp, True)
+        atexit.register(shutil.rmtree, self.trash_png, True)
 
     # ---- status / background jobs ------------------------------------------
     def set_status(self, text: str, kind: str = "info") -> None:
@@ -425,30 +437,31 @@ class App:
     def _remove(self, doomed: list[backend.Frame], verb: str) -> None:
         if not doomed:
             return
-        self.trash.mkdir(parents=True, exist_ok=True)
-        moved: list[tuple[backend.Frame, Path | None, Path | None]] = []
+        self._trash_seq += 1
+        png_trash = self.trash_png / f"{self._trash_seq:06d}"
+        thumb_trash = self.trash / f"{self._trash_seq:06d}"
+        moved: list[list] = []          # [frame, trashed png, trashed thumb]
         try:
-            for f in doomed:
-                saved_path: Path | None = None
-                saved_thumb: Path | None = None
-                for path in (f.path, f.thumb):
-                    if path.exists():
-                        target = self.trash / f"{len(moved):06d}_{path.name}"
-                        shutil.move(str(path), str(target))
-                        if path == f.path:
-                            saved_path = target
-                        else:
-                            saved_thumb = target
-                moved.append((f, saved_path, saved_thumb))
+            png_trash.mkdir(parents=True, exist_ok=True)
+            thumb_trash.mkdir(parents=True, exist_ok=True)
+            for n, f in enumerate(doomed):
+                entry = [f, None, None]
+                moved.append(entry)
+                for slot, src, dst in ((1, f.path, png_trash / f"{n:06d}.png"),
+                                       (2, f.thumb, thumb_trash / f"{n:06d}.jpg")):
+                    try:
+                        os.replace(src, dst)      # same drive: just a rename
+                        entry[slot] = dst
+                    except FileNotFoundError:
+                        pass
         except OSError as e:
             for frame, path, thumb in moved:
-                if path is not None and path.exists():
-                    shutil.move(str(path), str(frame.path))
-                if thumb is not None and thumb.exists():
-                    shutil.move(str(thumb), str(frame.thumb))
+                for saved, orig in ((path, frame.path), (thumb, frame.thumb)):
+                    if saved is not None and saved.exists():
+                        os.replace(saved, orig)
             self.set_status(f"Couldn't delete frames: {short_err(e)}", "error")
             return
-        self.undo_stack.append(moved)
+        self.undo_stack.append([tuple(m) for m in moved])
         gone = {id(f) for f in doomed}
         self.frames = [f for f in self.frames if id(f) not in gone]
         for f in doomed:
@@ -469,18 +482,25 @@ class App:
         if not self.undo_stack:
             return
         restored = self.undo_stack.pop()
+        have = {id(f) for f in self.frames}      # O(1) lookups (was O(n^2))
+        failed = 0
         for f, path, thumb in restored:
-            if path is not None and path.exists():
-                f.path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(path), str(f.path))
-            if thumb is not None and thumb.exists():
-                f.thumb.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(thumb), str(f.thumb))
-            if f not in self.frames:
+            try:
+                for saved, orig in ((path, f.path), (thumb, f.thumb)):
+                    if saved is not None and saved.exists():
+                        orig.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(saved, orig)
+            except OSError:
+                failed += 1
+            if id(f) not in have:
                 self.frames.append(f)
         self.frames.sort(key=lambda f: f.index)
         self.select_none()
-        self.set_status(f"Restored {len(restored)} frames.", "ok")
+        if failed:
+            self.set_status(f"Restored {len(restored) - failed} frames, "
+                            f"{failed} couldn't be moved back.", "error")
+        else:
+            self.set_status(f"Restored {len(restored)} frames.", "ok")
 
     def toggle_history(self) -> None:
         self.history_open = not self.history_open
@@ -535,7 +555,7 @@ class App:
             self.btn[name].rect = pygame.Rect(right - bw_, y, bw_, 34)
             right -= bw_ + 8
 
-        n_sel = sum(f.selected for f in self.frames)
+        n_sel = self.n_sel = sum(f.selected for f in self.frames)   # once per frame
         for name in ("all", "none", "invert", "delete", "keep", "open"):
             self.btn[name].visible = has
         self.btn["fetch"].enabled = not self.busy
@@ -704,19 +724,41 @@ class App:
 
     def get_thumb(self, f: backend.Frame):
         s = self.thumbs.get(f.index)
-        if s is None and self.loads_left > 0:
-            self.loads_left -= 1
-            try:
-                img = pygame.image.load(str(f.thumb)).convert()
-                iw, ih = img.get_size()
+        if s is not None:
+            self.thumbs.move_to_end(f.index)
+            return s
+        # Decode at most ~LOAD_BUDGET_MS of thumbnails per frame (always at
+        # least one) so a fast scroll never stalls the UI; the rest fill in
+        # over the next few frames.
+        if (self.loads_this_frame
+                and pygame.time.get_ticks() - self.load_t0 > LOAD_BUDGET_MS):
+            return None
+        self.loads_this_frame += 1
+        try:
+            img = pygame.image.load(str(f.thumb)).convert()
+            iw, ih = img.get_size()
+            if iw > THUMB_W or ih > THUMB_H:   # older/foreign thumbnails only
                 k = min(THUMB_W / iw, THUMB_H / ih)
-                s = pygame.transform.smoothscale(
+                img = pygame.transform.smoothscale(
                     img, (max(1, int(iw * k)), max(1, int(ih * k))))
-            except Exception:  # noqa: BLE001
-                s = pygame.Surface((THUMB_W, THUMB_H))
-                s.fill((70, 40, 40))
-            self.thumbs[f.index] = s
+            s = img
+        except Exception:  # noqa: BLE001
+            s = pygame.Surface((THUMB_W, THUMB_H))
+            s.fill((70, 40, 40))
+        self.thumbs[f.index] = s
+        while len(self.thumbs) > THUMB_CACHE_MAX:
+            self.thumbs.popitem(last=False)
         return s
+
+    def label(self, s: str, font: pygame.font.Font, color) -> pygame.Surface:
+        """Render text once; grid labels repeat every frame at 60 fps."""
+        key = (s, color, id(font))
+        surf = self.label_cache.get(key)
+        if surf is None:
+            if len(self.label_cache) >= LABEL_CACHE_MAX:
+                self.label_cache.clear()
+            surf = self.label_cache[key] = font.render(s, True, color)
+        return surf
 
     def draw_grid(self) -> None:
         r = self.L["grid"]
@@ -729,7 +771,8 @@ class App:
         total = rows * CELL_H + 8
         self.scroll = max(0, min(self.scroll, total - r.h))
         self.geom = (x0, cols)
-        self.loads_left = 40
+        self.load_t0 = pygame.time.get_ticks()
+        self.loads_this_frame = 0
 
         prev = self.screen.get_clip()
         self.screen.set_clip(r)
@@ -757,11 +800,11 @@ class App:
                                       [(c[0] - 5, c[1]), (c[0] - 1, c[1] + 4),
                                        (c[0] + 5, c[1] - 4)], 2)
                 ly = cell.y + THUMB_H + 10
-                self.text(f"#{f.index}", (cell.x + 8, ly), self.small, DIM)
+                self.screen.blit(self.label(f"#{f.index}", self.small, DIM),
+                                 (cell.x + 8, ly))
                 if f.t is not None:
-                    ts = f"{f.t:.3f}s"
-                    self.text(ts, (cell.right - 8 - self.small.size(ts)[0], ly),
-                              self.small, TEXT)
+                    ts = self.label(f"{f.t:.3f}s", self.small, TEXT)
+                    self.screen.blit(ts, (cell.right - 8 - ts.get_width(), ly))
         self.screen.set_clip(prev)
 
         if total > r.h:
@@ -836,8 +879,7 @@ class App:
         if self.frames:
             tb = self.L["toolbar"]
             pygame.draw.rect(s, PANEL, tb)
-            n_sel = sum(f.selected for f in self.frames)
-            self.text(f"{len(self.frames)} frames, {n_sel} selected",
+            self.text(f"{len(self.frames)} frames, {self.n_sel} selected",
                       (self.btn["invert"].rect.right + 16, tb.y + 16), self.small, DIM)
             for name in ("all", "none", "invert", "delete", "keep", "open"):
                 self.draw_button(self.btn[name])

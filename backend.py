@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
+import time
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.util import find_spec
@@ -18,7 +20,9 @@ ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / "cache"      # downloaded source videos (safe to delete)
 OUTPUT_DIR = ROOT / "output"    # extracted frames land here
 
-THUMB_MAX = 320                 # longest side of grid thumbnails (px)
+THUMB_W, THUMB_H = 192, 108     # grid thumbnails are made at display size
+MAX_WORKERS = 8                # cap on parallel ffmpeg processes
+MIN_CHUNK_FRAMES = 150         # never slice a range finer than this
 PNG_COMPRESSION = 3             # 0-9: lower = faster + bigger files
 
 # progress callback: (fraction 0..1 or None for "unknown", status text)
@@ -228,134 +232,233 @@ def make_multi_output_dir(info: VideoInfo) -> Path:
     return d
 
 
-def extract_frames(src: Path, start: float, end: float, out_dir: Path,
-                   thumb_dir: Path, expected: int, progress: Progress,
-                   cancel: threading.Event) -> list[Frame]:
-    """Decode every frame with timestamp in [start, end).
+# --------------------------------------------------------------------------
+# Extraction (parallel)
+# --------------------------------------------------------------------------
+def _worker_count() -> int:
+    """How many ffmpeg processes to run at once (override: YTFG_WORKERS)."""
+    env = os.environ.get("YTFG_WORKERS", "").strip()
+    if env.isdigit() and int(env) >= 1:
+        return int(env)
+    return max(1, min(os.cpu_count() or 1, MAX_WORKERS))
 
-    One ffmpeg pass writes full-res PNGs to out_dir and small JPG thumbnails
-    to thumb_dir. The showinfo filter reports each frame's real timestamp, so
-    variable-frame-rate videos are labelled correctly.
+
+@dataclass
+class _Job:
+    """One ffmpeg run: a slice of one requested range, in integer ms."""
+    range_idx: int
+    piece: int           # position within its range (0 = first)
+    start_ms: int
+    end_ms: int
+    png_dir: Path
+    thumb_dir: Path
+    times: Optional[list] = None   # per-frame pts_time (relative to start)
+
+
+def _plan_jobs(ranges: list[tuple[float, float]], expected: int, workers: int,
+               png_root: Path, thumb_root: Path) -> list[_Job]:
+    """Cut the ranges into slices so every worker has something to do.
+
+    PNG encoding is single-threaded inside one ffmpeg process, so a single
+    big range would otherwise use one core. Slices are never smaller than
+    MIN_CHUNK_FRAMES, because each slice pays a seek + decode-from-keyframe
+    cost. If the frame rate is unknown (expected == 0) ranges aren't split.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    thumb_dir.mkdir(parents=True, exist_ok=True)
-    mode = list(_fps_mode_args())
-    scale = (f"scale={THUMB_MAX}:{THUMB_MAX}:force_original_aspect_ratio=decrease"
-             ":force_divisible_by=2")
+    total_dur = sum(e - s for s, e in ranges) or 1.0
+    target = max(MIN_CHUNK_FRAMES, -(-expected // workers)) if expected else 0
+    jobs: list[_Job] = []
+    for ri, (s, e) in enumerate(ranges):
+        s_ms, e_ms = round(s * 1000), round(e * 1000)
+        est = expected * (e - s) / total_dur if expected else 0
+        pieces = max(1, round(est / target)) if target else 1
+        pieces = min(pieces, max(1, e_ms - s_ms))   # no empty slices
+        for k in range(pieces):
+            a = s_ms + (e_ms - s_ms) * k // pieces
+            b = s_ms + (e_ms - s_ms) * (k + 1) // pieces
+            n = len(jobs)
+            jobs.append(_Job(ri, k, a, b,
+                             png_root / f".work_{n:04d}",
+                             thumb_root / f".work_{n:04d}"))
+    return jobs
 
-    cmd = [
+
+def _ffmpeg_cmd(src: Path, job: _Job, decoder_threads: int) -> list[str]:
+    scale = (f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease"
+             ":force_divisible_by=2:flags=area")
+    mode = list(_fps_mode_args())
+    pre = ["-threads", str(decoder_threads)] if decoder_threads else []
+    return [
         "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info", "-y",
         # -ss before -i: fast seek, then ffmpeg decodes up to the exact frame
-        "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", str(src),
+        *pre, "-ss", f"{job.start_ms / 1000:.3f}",
+        "-t", f"{(job.end_ms - job.start_ms) / 1000:.3f}", "-i", str(src),
         # output 1: full-res PNGs
         "-map", "0:v:0", "-an", "-sn", *mode, "-start_number", "0",
-        "-compression_level", str(PNG_COMPRESSION), str(out_dir / "%06d.png"),
+        "-compression_level", str(PNG_COMPRESSION),
+        str(job.png_dir / "%06d.png"),
         # output 2: thumbnails (showinfo prints one line per frame)
         "-map", "0:v:0", "-an", "-sn", *mode, "-start_number", "0",
-        "-vf", f"showinfo,{scale}", "-q:v", "4", str(thumb_dir / "%06d.jpg"),
+        "-vf", f"showinfo,{scale}", "-q:v", "4", str(job.thumb_dir / "%06d.jpg"),
     ]
-
-    def cleanup():
-        shutil.rmtree(out_dir, ignore_errors=True)
-        shutil.rmtree(thumb_dir, ignore_errors=True)
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
-    times: list[Optional[float]] = []
-    tail: deque[str] = deque(maxlen=6)
-    try:
-        for line in proc.stderr:
-            if cancel.is_set():
-                raise Cancelled()
-            m = _SHOWINFO.search(line)
-            if m:
-                times.append(_to_float(m.group(2)))
-                frac = min(len(times) / expected, 1.0) if expected else None
-                progress(frac, f"Extracting frames... {len(times)}")
-            elif line.strip():
-                tail.append(line.rstrip())
-        rc = proc.wait()
-    except BaseException:
-        proc.kill()
-        proc.wait()
-        cleanup()
-        raise
-
-    if rc != 0:
-        cleanup()
-        raise RuntimeError("ffmpeg failed: " + " | ".join(tail))
-
-    pngs = sorted(out_dir.glob("*.png"))
-    thumbs = sorted(thumb_dir.glob("*.jpg"))
-    if not pngs:
-        cleanup()
-        raise RuntimeError("No frames in that range (past the end of the video?)")
-
-    have_times = len(times) == len(pngs)
-    frames: list[Frame] = []
-    for i in range(min(len(pngs), len(thumbs))):
-        t = None
-        path = pngs[i]
-        if have_times and times[i] is not None:
-            t = start + times[i]
-            named = out_dir / f"{i:06d}_{t:.3f}s.png"
-            path.rename(named)
-            path = named
-        frames.append(Frame(index=i, path=path, thumb=thumbs[i], t=t))
-    return frames
 
 
 def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
                    thumb_dir: Path, expected: int, progress: Progress,
-                   cancel: threading.Event) -> list[Frame]:
-    """Extract several ranges into one ordered frame collection."""
+                   cancel: threading.Event,
+                   workers: Optional[int] = None) -> list[Frame]:
+    """Decode every frame with timestamp in [start, end) for each range.
+
+    Ranges (and big ranges, split into slices) are decoded by several ffmpeg
+    processes at once. Each process writes full-res PNGs straight into a work
+    folder inside out_dir (same filesystem, so the final rename is free) and
+    small JPG thumbnails into thumb_dir. showinfo reports each frame's real
+    timestamp, so variable-frame-rate videos are labelled correctly.
+    """
+    workers = workers or _worker_count()
     out_dir.mkdir(parents=True, exist_ok=True)
     thumb_dir.mkdir(parents=True, exist_ok=True)
-    total_duration = sum(end - start for start, end in ranges)
-    total_expected = expected
-    all_frames: list[Frame] = []
-    try:
-        for range_index, (start, end) in enumerate(ranges, 1):
-            if cancel.is_set():
-                raise Cancelled()
-            segment_out = Path(tempfile.mkdtemp(prefix="frames_", dir=thumb_dir))
-            segment_thumb = Path(tempfile.mkdtemp(prefix="thumbs_", dir=thumb_dir))
-            segment_expected = (
-                round(expected * (end - start) / total_duration)
-                if expected and total_duration else 0
-            )
+    jobs = _plan_jobs(ranges, expected, workers, out_dir, thumb_dir)
+    pool_size = min(workers, len(jobs))
+    # don't let N processes each spawn a full set of decoder threads
+    decoder_threads = max(1, (os.cpu_count() or 1) // pool_size) if pool_size > 1 else 0
 
-            def segment_progress(frac, text, offset=len(all_frames)):
-                if frac is None or not total_expected:
-                    progress(None, f"Range {range_index}/{len(ranges)}: {text}")
-                else:
-                    progress(
-                        min((offset + frac * segment_expected) / total_expected, 1.0),
-                        f"Range {range_index}/{len(ranges)}: {text}",
-                    )
+    abort = threading.Event()
+    lock = threading.Lock()
+    procs: set[subprocess.Popen] = set()
+    done = [0]
+    last_report = [0.0]
 
-            frames = extract_frames(
-                src, start, end, segment_out, segment_thumb,
-                segment_expected, segment_progress, cancel,
-            )
-            for frame in frames:
-                index = len(all_frames)
-                suffix = f"_{frame.t:.3f}s" if frame.t is not None else ""
-                path = out_dir / f"{index:06d}{suffix}.png"
-                thumb = thumb_dir / f"{index:06d}.jpg"
-                shutil.move(str(frame.path), path)
-                shutil.move(str(frame.thumb), thumb)
-                all_frames.append(Frame(index, path, thumb, frame.t))
-            shutil.rmtree(segment_out, ignore_errors=True)
-            shutil.rmtree(segment_thumb, ignore_errors=True)
-    except BaseException:
+    def report(force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - last_report[0] < 0.05:   # <= 20 updates/s
+            return
+        last_report[0] = now
+        frac = min(done[0] / expected, 1.0) if expected else None
+        who = f" ({pool_size} workers)" if pool_size > 1 else ""
+        progress(frac, f"Extracting frames... {done[0]}"
+                       + (f" / ~{expected}" if expected else "") + who)
+
+    def run(job: _Job) -> None:
+        if abort.is_set():
+            raise Cancelled()
+        job.png_dir.mkdir(parents=True, exist_ok=True)
+        job.thumb_dir.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen(
+            _ffmpeg_cmd(src, job, decoder_threads), stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        with lock:
+            procs.add(proc)
+        times: list[Optional[float]] = []
+        tail: deque[str] = deque(maxlen=6)
+        try:
+            for line in proc.stderr:
+                m = _SHOWINFO.search(line)
+                if m:
+                    times.append(_to_float(m.group(2)))
+                    with lock:
+                        done[0] += 1
+                        report()
+                elif line.strip():
+                    tail.append(line.rstrip())
+            rc = proc.wait()
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            with lock:
+                procs.discard(proc)
+            proc.stderr.close()
+        if abort.is_set():
+            raise Cancelled()
+        if rc != 0:
+            raise RuntimeError("ffmpeg failed: " + " | ".join(tail))
+        job.times = times
+
+    def cleanup() -> None:
         shutil.rmtree(out_dir, ignore_errors=True)
         shutil.rmtree(thumb_dir, ignore_errors=True)
-        raise
 
-    if not all_frames:
-        raise RuntimeError("No frames in the requested ranges")
-    return all_frames
+    pool = ThreadPoolExecutor(max_workers=pool_size)
+    futures = [pool.submit(run, j) for j in jobs]
+    try:
+        pending = set(futures)
+        while pending:
+            finished, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            if cancel.is_set():
+                raise Cancelled()
+            for f in finished:
+                f.result()          # re-raises the first ffmpeg failure
+        with lock:
+            report(force=True)
+    except BaseException:
+        abort.set()
+        with lock:
+            for p in procs:         # unblocks every reader immediately
+                p.kill()
+        for f in futures:
+            f.cancel()
+        pool.shutdown(wait=True)
+        cleanup()
+        raise
+    pool.shutdown()
+
+    try:
+        frames = _assemble(jobs, out_dir, thumb_dir)
+    except BaseException:
+        cleanup()
+        raise
+    if not frames:
+        cleanup()
+        raise RuntimeError("No frames in the requested ranges "
+                           "(past the end of the video?)")
+    return frames
+
+
+def _assemble(jobs: list[_Job], out_dir: Path, thumb_dir: Path) -> list[Frame]:
+    """Move each slice's frames into final, globally numbered names."""
+    frames: list[Frame] = []
+    prev_last_t: Optional[float] = None
+    for job in jobs:
+        pngs = sorted(job.png_dir.glob("*.png"))
+        thumbs = sorted(job.thumb_dir.glob("*.jpg"))
+        times = job.times or []
+        have_times = len(times) == len(pngs)
+        first_in_slice = True
+        for i in range(min(len(pngs), len(thumbs))):
+            t = None
+            if have_times and times[i] is not None:
+                t = round(job.start_ms / 1000 + times[i], 6)
+            # A frame sitting exactly on a slice boundary could be emitted by
+            # both neighbours; keep it once. (pts_time is printed with 6
+            # decimals relative to each slice, so allow 0.1 ms of slack;
+            # real frames are always several ms apart.)
+            if (first_in_slice and job.piece > 0 and t is not None
+                    and prev_last_t is not None and t <= prev_last_t + 1e-4):
+                first_in_slice = False
+                continue
+            first_in_slice = False
+            index = len(frames)
+            suffix = f"_{t:.3f}s" if t is not None else ""
+            path = out_dir / f"{index:06d}{suffix}.png"
+            thumb = thumb_dir / f"{index:06d}.jpg"
+            os.replace(pngs[i], path)
+            os.replace(thumbs[i], thumb)
+            frames.append(Frame(index, path, thumb, t))
+            if t is not None:
+                prev_last_t = t
+        shutil.rmtree(job.png_dir, ignore_errors=True)
+        shutil.rmtree(job.thumb_dir, ignore_errors=True)
+    return frames
+
+
+def extract_frames(src: Path, start: float, end: float, out_dir: Path,
+                   thumb_dir: Path, expected: int, progress: Progress,
+                   cancel: threading.Event,
+                   workers: Optional[int] = None) -> list[Frame]:
+    """Single-range convenience wrapper around extract_ranges."""
+    return extract_ranges(src, [(start, end)], out_dir, thumb_dir, expected,
+                          progress, cancel, workers)
 
 
 def delete_frames(frames: list[Frame]) -> None:
