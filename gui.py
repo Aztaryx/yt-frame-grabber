@@ -596,7 +596,7 @@ class App:
         if not g.collidepoint(pos) or not self.frames:
             return None
         x0, cols = self.geom
-        row = (pos[1] - g.y + self.scroll) // self.grid_row_height
+        row = int((pos[1] - g.y + self.scroll) // self.grid_row_height)
         col = (pos[0] - x0) // CELL_W
         if col < 0 or col >= cols or row < 0 or row >= len(self.grid_rows):
             return None
