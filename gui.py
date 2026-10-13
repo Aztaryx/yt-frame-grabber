@@ -44,6 +44,16 @@ GRID_TOP = 168
 TOOLBAR_H = 52
 
 
+def approach(value: float, target: float, dt: float, speed: float = 14.0) -> float:
+    """Frame-rate independent chase used for responsive UI motion."""
+    return value + (target - value) * (1.0 - 2.718281828 ** (-speed * dt))
+
+
+def mix_color(a: tuple[int, int, int], b: tuple[int, int, int],
+              amount: float) -> tuple[int, int, int]:
+    return tuple(round(x + (y - x) * amount) for x, y in zip(a, b))
+
+
 def get_clipboard() -> str:
     try:
         import pyperclip
@@ -194,6 +204,9 @@ class Button:
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.enabled = True
         self.visible = True
+        self.hover_amount = 0.0
+        self.press_amount = 0.0
+        self.pressed = False
 
 
 @dataclass
@@ -241,6 +254,7 @@ class App:
         self.cancel = threading.Event()
         self.busy = False
         self.progress: float | None = None
+        self.dt = 1 / 60
 
         self.info: backend.VideoInfo | None = None
         self.frames: list[backend.Frame] = []
@@ -254,6 +268,7 @@ class App:
         self.status_kind = "info"
 
         self.scroll = 0
+        self.scroll_target = 0.0
         self.geom = (0, 1)
         self.thumbs: OrderedDict[int, pygame.Surface] = OrderedDict()   # LRU
         self.load_t0 = 0
@@ -406,6 +421,7 @@ class App:
         self.display_ranges = list(ranges or [])
         self.thumbs.clear()
         self.scroll = 0
+        self.scroll_target = 0.0
         self.anchor = None
         self.preview = None
         snapshot = [
@@ -590,6 +606,9 @@ class App:
         return row_items[col]
 
     def handle(self, e: pygame.event.Event) -> None:
+        if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+            for b in self.btn.values():
+                b.pressed = False
         if self.preview is not None:
             self.handle_preview(e)
             return
@@ -618,6 +637,7 @@ class App:
             if e.button == 1:
                 for b in self.btn.values():
                     if b.visible and b.enabled and b.rect.collidepoint(e.pos):
+                        b.pressed = True
                         b.action()
                         return
                 for fld in (self.url_field, self.range_field):
@@ -650,7 +670,7 @@ class App:
                 self.frames[i].selected = self.drag_state
 
         elif e.type == pygame.MOUSEWHEEL:
-            self.scroll -= e.y * 70
+            self.scroll_target -= e.y * 70
 
         elif e.type == pygame.TEXTINPUT:
             for fld in (self.url_field, self.range_field):
@@ -703,19 +723,39 @@ class App:
         font = font or self.font
         self.screen.blit(font.render(s, True, color), pos)
 
+    def animate(self) -> None:
+        mouse = pygame.mouse.get_pos()
+        for b in self.btn.values():
+            target = 1.0 if b.visible and b.enabled and b.rect.collidepoint(mouse) else 0.0
+            b.hover_amount = approach(b.hover_amount, target, self.dt, 18.0)
+            b.press_amount = approach(
+                b.press_amount, 1.0 if b.pressed else 0.0, self.dt, 30.0)
+
     def draw_button(self, b: Button) -> None:
         if not b.visible:
             return
-        hover = b.enabled and b.rect.collidepoint(pygame.mouse.get_pos())
         if not b.enabled:
             col = BTN_OFF
         elif b.primary:
-            col = ACCENT_DK if hover else ACCENT
+            col = mix_color(ACCENT, ACCENT_DK, b.hover_amount * 0.65)
         else:
-            col = BTN_HOVER if hover else BTN
-        pygame.draw.rect(self.screen, col, b.rect, border_radius=6)
+            col = mix_color(BTN, BTN_HOVER, b.hover_amount)
+        rect = b.rect.inflate(round(b.hover_amount * 4), round(b.hover_amount * 2))
+        press_y = round(b.press_amount * 2)
+        rect.y += press_y
+        if b.enabled and b.hover_amount > 0.01:
+            glow = pygame.Surface((rect.w + 12, rect.h + 12), pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*ACCENT, round(18 * b.hover_amount)),
+                             glow.get_rect(), border_radius=8)
+            self.screen.blit(glow, (rect.x - 6, rect.y - 6))
+        pygame.draw.rect(self.screen, col, rect, border_radius=6)
+        if b.enabled and b.hover_amount > 0.01:
+            highlight = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+            pygame.draw.rect(highlight, (255, 255, 255, round(14 * b.hover_amount)),
+                             highlight.get_rect(), border_radius=6)
+            self.screen.blit(highlight, rect.topleft)
         img = self.font.render(b.label, True, TEXT if b.enabled else DIM)
-        self.screen.blit(img, img.get_rect(center=b.rect.center))
+        self.screen.blit(img, img.get_rect(center=rect.center))
 
     def info_line(self) -> str:
         i = self.info
@@ -804,7 +844,9 @@ class App:
             ]
         rows = len(self.grid_rows)
         total = rows * self.grid_row_height + 8
-        self.scroll = max(0, min(self.scroll, total - r.h))
+        max_scroll = max(0, total - r.h)
+        self.scroll_target = max(0.0, min(self.scroll_target, max_scroll))
+        self.scroll = approach(self.scroll, self.scroll_target, self.dt, 16.0)
         self.geom = (x0, cols)
         self.load_t0 = pygame.time.get_ticks()
         self.loads_this_frame = 0
@@ -854,7 +896,8 @@ class App:
 
         if total > r.h:
             bar_h = max(24, r.h * r.h // total)
-            bar_y = r.y + (r.h - bar_h) * self.scroll // max(1, total - r.h)
+            bar_y = int(r.y + (r.h - bar_h) * self.scroll
+                        / max(1, total - r.h))
             pygame.draw.rect(self.screen, BORDER, (r.right - 7, bar_y, 4, bar_h),
                              border_radius=2)
 
@@ -892,6 +935,7 @@ class App:
         if self.preview is not None:
             self.draw_preview()
             return
+        self.animate()
         s = self.screen
         w, h = s.get_size()
         s.fill(BG)
@@ -1010,7 +1054,7 @@ class App:
             self.drain()
             self.draw()
             pygame.display.flip()
-            clock.tick(60)
+            self.dt = min(clock.tick(60) / 1000.0, 0.05)
             if self._closing:
                 running = False
         self.cancel.set()
