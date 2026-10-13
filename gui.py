@@ -12,7 +12,6 @@ import tempfile
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from math import ceil
 from pathlib import Path
 
 import pygame
@@ -267,6 +266,8 @@ class App:
 
         self.preview: int | None = None
         self._pv = None
+        self.display_ranges: list[tuple[float, float]] = []
+        self.grid_rows: list[list[int] | None] = []
 
         self.tmp = Path(tempfile.mkdtemp(prefix="ytframes_"))
         self.trash = self.tmp / "deleted"            # thumbnails of removed frames
@@ -319,7 +320,7 @@ class App:
             elif kind == "status":
                 self.set_status(msg[1], msg[2])
             elif kind == "frames":
-                self.load_frames(msg[1], msg[2])
+                self.load_frames(msg[1], msg[2], msg[3] if len(msg) > 3 else [])
             elif kind == "focus_range":
                 self.url_field.focus, self.range_field.focus = False, True
             elif kind == "done":
@@ -394,19 +395,21 @@ class App:
                 src, bounded, out_dir, thumb_dir, expected,
                 self._progress, self.cancel,
             )
-            self.q.put(("frames", frames, out_dir))
+            self.q.put(("frames", frames, out_dir, ranges))
 
         self._run(job)
 
-    def load_frames(self, frames, out_dir: Path) -> None:
+    def load_frames(self, frames, out_dir: Path,
+                    ranges: list[tuple[float, float]] | None = None) -> None:
         self.frames = frames
         self.out_dir = out_dir
+        self.display_ranges = list(ranges or [])
         self.thumbs.clear()
         self.scroll = 0
         self.anchor = None
         self.preview = None
         snapshot = [
-            backend.Frame(f.index, f.path, f.thumb, f.t, False)
+            backend.Frame(f.index, f.path, f.thumb, f.t, False, f.range_idx)
             for f in frames
         ]
         self.history = [
@@ -507,7 +510,7 @@ class App:
 
     def load_history(self, entry: HistoryEntry) -> None:
         available = [
-            backend.Frame(f.index, f.path, f.thumb, f.t, False)
+            backend.Frame(f.index, f.path, f.thumb, f.t, False, f.range_idx)
             for f in entry.frames
             if f.path.exists() and f.thumb.exists()
         ]
@@ -518,7 +521,11 @@ class App:
         self.range_field.set(entry.ranges)
         self.info = self.info if self.info and self.info.url == entry.url else None
         self.history_open = False
-        self.load_frames(available, entry.out_dir)
+        try:
+            ranges = timeparse.parse_ranges(entry.ranges)
+        except timeparse.TimeParseError:
+            ranges = []
+        self.load_frames(available, entry.out_dir, ranges)
         self.set_status(
             f"Reopened {len(available)} saved frames from {entry.out_dir.name}.", "ok")
 
@@ -573,12 +580,14 @@ class App:
         if not g.collidepoint(pos) or not self.frames:
             return None
         x0, cols = self.geom
+        row = (pos[1] - g.y + self.scroll) // self.grid_row_height
         col = (pos[0] - x0) // CELL_W
-        row = (pos[1] - g.y + self.scroll) // CELL_H
-        if col < 0 or col >= cols:
+        if col < 0 or col >= cols or row < 0 or row >= len(self.grid_rows):
             return None
-        i = row * cols + col
-        return i if 0 <= i < len(self.frames) else None
+        row_items = self.grid_rows[row]
+        if row_items is None or col >= len(row_items):
+            return None
+        return row_items[col]
 
     def handle(self, e: pygame.event.Event) -> None:
         if self.preview is not None:
@@ -760,6 +769,14 @@ class App:
             surf = self.label_cache[key] = font.render(s, True, color)
         return surf
 
+    @staticmethod
+    def range_endpoint(seconds: float) -> str:
+        minutes, remainder = divmod(seconds, 60)
+        if minutes >= 60:
+            hours, minutes = divmod(int(minutes), 60)
+            return f"{hours}:{minutes:02d}:{remainder:05.2f}".rstrip("0").rstrip(".")
+        return f"{int(minutes)}:{remainder:04.2f}".rstrip("0").rstrip(".")
+
     def draw_grid(self) -> None:
         r = self.L["grid"]
         n = len(self.frames)
@@ -767,8 +784,26 @@ class App:
             return
         cols = max(1, r.w // CELL_W)
         x0 = r.x + (r.w - cols * CELL_W) // 2
-        rows = ceil(n / cols)
-        total = rows * CELL_H + 8
+        separated = len(self.display_ranges) > 5
+        self.grid_row_height = CELL_H + (28 if separated else 0)
+        self.grid_rows = []
+        if separated:
+            groups: list[list[int]] = [[] for _ in self.display_ranges]
+            for i, f in enumerate(self.frames):
+                groups[min(max(f.range_idx, 0), len(groups) - 1)].append(i)
+            for group in groups:
+                self.grid_rows.append(None)
+                self.grid_rows.extend(
+                    group[start:start + cols]
+                    for start in range(0, len(group), cols)
+                )
+        else:
+            self.grid_rows = [
+                list(range(start, min(start + cols, n)))
+                for start in range(0, n, cols)
+            ]
+        rows = len(self.grid_rows)
+        total = rows * self.grid_row_height + 8
         self.scroll = max(0, min(self.scroll, total - r.h))
         self.geom = (x0, cols)
         self.load_t0 = pygame.time.get_ticks()
@@ -776,15 +811,25 @@ class App:
 
         prev = self.screen.get_clip()
         self.screen.set_clip(r)
-        r0 = int(self.scroll // CELL_H)
-        r1 = min(rows - 1, int((self.scroll + r.h) // CELL_H))
+        r0 = int(self.scroll // self.grid_row_height)
+        r1 = min(rows - 1, int((self.scroll + r.h) // self.grid_row_height))
         for row in range(r0, r1 + 1):
-            for col in range(cols):
-                i = row * cols + col
-                if i >= n:
-                    break
+            row_items = self.grid_rows[row]
+            y = r.y + row * self.grid_row_height - self.scroll
+            if row_items is None:
+                range_i = sum(items is None for items in self.grid_rows[:row])
+                start, end = self.display_ranges[range_i]
+                label = (f"Range {range_i + 1}   "
+                         f"{self.range_endpoint(start)}-"
+                         f"{self.range_endpoint(end)}")
+                pygame.draw.line(self.screen, BORDER,
+                                 (x0, y + 15), (r.right - x0, y + 15))
+                self.screen.blit(self.label(label, self.small, TEXT),
+                                 (x0 + 8, y + 7))
+                continue
+            for col, i in enumerate(row_items):
                 f = self.frames[i]
-                cell = pygame.Rect(x0 + col * CELL_W, r.y + row * CELL_H - self.scroll,
+                cell = pygame.Rect(x0 + col * CELL_W, y + (28 if separated else 0),
                                    CELL_W, CELL_H).inflate(-8, -8)
                 pygame.draw.rect(self.screen, SEL_BG if f.selected else PANEL,
                                  cell, border_radius=8)

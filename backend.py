@@ -63,6 +63,7 @@ class Frame:
     thumb: Path
     t: Optional[float]       # absolute timestamp in the video (seconds)
     selected: bool = False
+    range_idx: int = 0       # index of the requested range that produced it
 
 
 # --------------------------------------------------------------------------
@@ -444,7 +445,7 @@ def _assemble(jobs: list[_Job], out_dir: Path, thumb_dir: Path) -> list[Frame]:
             thumb = thumb_dir / f"{index:06d}.jpg"
             os.replace(pngs[i], path)
             os.replace(thumbs[i], thumb)
-            frames.append(Frame(index, path, thumb, t))
+            frames.append(Frame(index, path, thumb, t, False, job.range_idx))
             if t is not None:
                 prev_last_t = t
         shutil.rmtree(job.png_dir, ignore_errors=True)
