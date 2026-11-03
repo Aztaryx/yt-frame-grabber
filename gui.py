@@ -8,6 +8,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from collections import OrderedDict
@@ -93,12 +94,14 @@ def open_folder(path: Path) -> None:
 
 # ---- widgets --------------------------------------------------------------
 class TextField:
-    def __init__(self, hint: str = "", normalize_newlines: bool = False):
+    def __init__(self, hint: str = "", normalize_newlines: bool = False,
+                 digits_only: bool = False):
         self.text = ""
         self.cur = 0
         self.focus = False
         self.hint = hint
         self.normalize_newlines = normalize_newlines
+        self.digits_only = digits_only
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.all = False      # "select all" state
         self._off = 0
@@ -113,6 +116,8 @@ class TextField:
             s = s.replace("\n", ", ")
         else:
             s = s.replace("\n", "")
+        if self.digits_only:
+            s = "".join(c for c in s if c in "0123456789")
         if not s:
             return
         if self.all:
@@ -215,6 +220,7 @@ class HistoryEntry:
     ranges: str
     out_dir: Path
     frames: list[backend.Frame]
+    step: str = "1"
 
 
 # ---- app ------------------------------------------------------------------
@@ -232,11 +238,14 @@ class App:
         self.range_field = TextField(
             "e.g.  87-88.5, 100-101", normalize_newlines=True
         )
+        self.step_field = TextField("1", digits_only=True)
+        self.fields = (self.url_field, self.range_field, self.step_field)
         self.url_field.set(url)
         self.range_field.set(rng)
         self.url_field.focus = True
 
         self.btn = {
+            "choose": Button("Choose video", self.choose_video),
             "fetch": Button("Fetch", self.do_fetch),
             "go": Button("Extract", self.do_go, primary=True),
             "all": Button("All", self.select_all, toolbar=True),
@@ -263,6 +272,7 @@ class App:
         self.history_open = False
         self.undo_stack: list[list[tuple[backend.Frame, Path | None, Path | None]]] = []
         self.close_prompt = False
+        self.file_picker: subprocess.Popen | None = None
 
         self.status = "Paste a link and one or more time ranges, then hit Extract."
         self.status_kind = "info"
@@ -321,6 +331,19 @@ class App:
         self.q.put(("progress", frac, text))
 
     def drain(self) -> None:
+        if self.file_picker is not None:
+            if self.file_picker.poll() is not None:
+                picker = self.file_picker
+                self.file_picker = None
+                path = picker.stdout.read().strip() if picker.stdout else ""
+                if picker.returncode == 0 and path:
+                    self.url_field.set(path)
+                    self.info = None
+                    self.do_fetch()
+                elif picker.returncode not in (0, 1):
+                    self.set_status(
+                        "Couldn't open the video chooser. Install tkinter "
+                        "for the selected Python environment.", "error")
         while True:
             try:
                 msg = self.q.get_nowait()
@@ -337,7 +360,8 @@ class App:
             elif kind == "frames":
                 self.load_frames(msg[1], msg[2], msg[3] if len(msg) > 3 else [])
             elif kind == "focus_range":
-                self.url_field.focus, self.range_field.focus = False, True
+                for fld in self.fields:
+                    fld.focus = fld is self.range_field
             elif kind == "done":
                 self.busy = False
                 self.progress = None
@@ -352,13 +376,43 @@ class App:
             return
 
         def job():
-            self._progress(None, "Fetching video info...")
-            info = backend.fetch_info(url)
+            self._progress(None, "Reading video info..." if Path(url).is_file()
+                           else "Fetching video info...")
+            info = (backend.fetch_local_info(Path(url))
+                    if Path(url).is_file() else backend.fetch_info(url))
             self.q.put(("info", info))
-            self.q.put(("status", "Got it. Enter one or more ranges and hit Extract.", "ok"))
+            self.q.put(("status", "Got it. Enter one or more ranges and hit Extract.",
+                        "ok"))
             self.q.put(("focus_range",))
 
         self._run(job)
+
+    def choose_video(self) -> None:
+        if self.busy or self.file_picker is not None:
+            return
+
+        picker = (
+            "import tkinter as tk\n"
+            "from tkinter import filedialog\n"
+            "root = tk.Tk()\n"
+            "root.withdraw()\n"
+            "path = filedialog.askopenfilename(\n"
+            "    title='Choose a video',\n"
+            "    filetypes=[('Video files', "
+            "'*.mp4 *.mkv *.webm *.mov *.avi *.m4v *.ts'), "
+            "('All files', '*')],\n"
+            ")\n"
+            "root.destroy()\n"
+            "print(path, flush=True)\n"
+        )
+        try:
+            self.file_picker = subprocess.Popen(
+                [sys.executable, "-c", picker],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as e:
+            self.set_status(f"Couldn't open video chooser: {short_err(e)}", "error")
 
     def do_go(self) -> None:
         if self.busy:
@@ -376,6 +430,7 @@ class App:
             return
         try:
             ranges = timeparse.parse_ranges(self.range_field.text)
+            step = timeparse.parse_step(self.step_field.text)
         except timeparse.TimeParseError as e:
             self.set_status(str(e), "error")
             return
@@ -384,8 +439,11 @@ class App:
         def job():
             info = known
             if info is None:
-                self._progress(None, "Fetching video info...")
-                info = backend.fetch_info(url)
+                local = Path(url).is_file()
+                self._progress(None, "Reading video info..." if local
+                               else "Fetching video info...")
+                info = (backend.fetch_local_info(Path(url))
+                        if local else backend.fetch_info(url))
                 self.q.put(("info", info))
             bounded = []
             for start, end in ranges:
@@ -394,21 +452,27 @@ class App:
                         f"Start is past the end of the video "
                         f"({timeparse.fmt_dur(info.duration)})."
                     )
+                if end == float("inf") and not info.duration:
+                    raise ValueError(
+                        "Couldn't determine the video duration for '*'. "
+                        "Use an explicit end time instead."
+                    )
                 bounded.append((start, min(end, info.duration))
                                if info.duration else (start, end))
 
             src = backend.ensure_downloaded(info, self._progress, self.cancel)
             self.q.put(("info", info))   # refresh with exact frame count
 
-            out_dir = (backend.make_output_dir(info, *bounded[0])
+            out_dir = (backend.make_output_dir(info, *bounded[0], step=step)
                        if len(bounded) == 1
-                       else backend.make_multi_output_dir(info))
+                       else backend.make_multi_output_dir(info, step=step))
             thumb_dir = self.tmp / out_dir.name
             expected = (round(info.fps * sum(end - start for start, end in bounded))
                         if info.fps else 0)
             frames = backend.extract_ranges(
                 src, bounded, out_dir, thumb_dir, expected,
                 self._progress, self.cancel,
+                step=step,
             )
             self.q.put(("frames", frames, out_dir, ranges))
 
@@ -434,7 +498,7 @@ class App:
         ]
         self.history.insert(0, HistoryEntry(
             self.url_field.text.strip(), self.range_field.text,
-            out_dir, snapshot,
+            out_dir, snapshot, self.step_field.text,
         ))
         self.history = self.history[:20]
         self.set_status(
@@ -535,6 +599,7 @@ class App:
             return
         self.url_field.set(entry.url)
         self.range_field.set(entry.ranges)
+        self.step_field.set(entry.step)
         self.info = self.info if self.info and self.info.url == entry.url else None
         self.history_open = False
         try:
@@ -558,13 +623,17 @@ class App:
         has = bool(self.frames)
         tb_h = TOOLBAR_H if has else 0
 
+        choose_w, gap = 122, 8
         self.L["url"] = pygame.Rect(76, 14, bx - 12 - 76, 34)
-        self.L["range"] = pygame.Rect(76, 58, 300, 34)
-        self.L["history"] = pygame.Rect(390, 58, 100, 34)
-        self.btn["undo"].rect = pygame.Rect(498, 58, 120, 34)
+        self.L["range"] = pygame.Rect(76, 58, 280, 34)
+        self.L["step"] = pygame.Rect(420, 58, 52, 34)
+        self.L["history"] = pygame.Rect(534, 58, 100, 34)
+        self.btn["undo"].rect = pygame.Rect(642, 58, 120, 34)
         self.url_field.rect = self.L["url"]
         self.range_field.rect = self.L["range"]
+        self.step_field.rect = self.L["step"]
         self.btn["fetch"].rect = pygame.Rect(bx, 14, bw, 34)
+        self.btn["choose"].rect = pygame.Rect(bx - choose_w - gap, 14, choose_w, 34)
         self.btn["go"].rect = pygame.Rect(bx, 58, bw, 34)
         self.btn["history"].rect = self.L["history"]
         self.L["grid"] = pygame.Rect(0, GRID_TOP, w, max(0, h - GRID_TOP - tb_h))
@@ -582,6 +651,7 @@ class App:
         for name in ("all", "none", "invert", "delete", "keep", "open"):
             self.btn[name].visible = has
         self.btn["fetch"].enabled = not self.busy
+        self.btn["choose"].enabled = not self.busy
         self.btn["go"].label = "Cancel" if self.busy else "Extract"
         self.btn["delete"].label = f"Delete selected ({n_sel})" if n_sel else "Delete selected"
         self.btn["delete"].enabled = n_sel > 0
@@ -640,7 +710,7 @@ class App:
                         b.pressed = True
                         b.action()
                         return
-                for fld in (self.url_field, self.range_field):
+                for fld in self.fields:
                     fld.focus = fld.rect.collidepoint(e.pos)
                     if fld.focus:
                         fld.click(e.pos[0])
@@ -673,21 +743,20 @@ class App:
             self.scroll_target -= e.y * 70
 
         elif e.type == pygame.TEXTINPUT:
-            for fld in (self.url_field, self.range_field):
+            for fld in self.fields:
                 if fld.focus:
                     fld.insert(e.text)
 
         elif e.type == pygame.KEYDOWN:
-            focused = self.url_field if self.url_field.focus else (
-                self.range_field if self.range_field.focus else None)
+            focused = next((f for f in self.fields if f.focus), None)
             if e.key == pygame.K_ESCAPE:
                 if self.busy:
                     self.cancel.set()
             elif e.key == pygame.K_TAB:
-                self.url_field.focus, self.range_field.focus = (
-                    self.range_field.focus, self.url_field.focus)
-                if not (self.url_field.focus or self.range_field.focus):
-                    self.url_field.focus = True
+                cur = next((i for i, f in enumerate(self.fields) if f.focus), -1)
+                for f in self.fields:
+                    f.focus = False
+                self.fields[(cur + 1) % len(self.fields)].focus = True
             elif focused is not None:
                 if focused.key(e):
                     if focused is self.url_field:
@@ -940,12 +1009,16 @@ class App:
         w, h = s.get_size()
         s.fill(BG)
 
-        self.text("URL", (16, 21), self.font, DIM)
+        self.text("URL or file", (16, 21), self.font, DIM)
         self.text("Ranges", (16, 65), self.font, DIM)
+        self.text("Every", (368, 65), self.font, DIM)
         self.url_field.draw(s, self.font)
         self.range_field.draw(s, self.font)
-        self.text("Separate ranges with commas, semicolons, or new lines",
-                  (self.L["history"].right + 14, 66), self.small, DIM)
+        self.step_field.draw(s, self.font)
+        self.text("frames", (self.step_field.rect.right + 8, 68), self.small, DIM)
+        hx = self.L["undo"].right + 14
+        self.text(fit(self.small, "Separate ranges with commas, semicolons, or new lines",
+                      w - hx - 16), (hx, 66), self.small, DIM)
         for b in self.btn.values():
             self.draw_button(b)
 
@@ -1058,4 +1131,6 @@ class App:
             if self._closing:
                 running = False
         self.cancel.set()
+        if self.file_picker is not None:
+            self.file_picker.terminate()
         pygame.quit()

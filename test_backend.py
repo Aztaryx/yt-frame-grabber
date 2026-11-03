@@ -33,11 +33,12 @@ class ExtractTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def run_extract(self, src, ranges, workers, expected=0, tag=""):
+    def run_extract(self, src, ranges, workers, expected=0, tag="", step=1):
         out = self.tmp / f"out{workers}{tag}"
         th = self.tmp / f"th{workers}{tag}"
         frames = backend.extract_ranges(src, ranges, out, th, expected,
-                                        lambda *_: None, threading.Event(), workers)
+                                        lambda *_: None, threading.Event(), workers,
+                                        step)
         return frames, out, th
 
     def test_parallel_matches_serial(self):
@@ -80,6 +81,32 @@ class ExtractTests(unittest.TestCase):
         make_clip(src, "30", seconds=2)
         with self.assertRaises(RuntimeError):
             self.run_extract(src, [(50, 51)], 1)
+
+    def test_step_keeps_every_nth_frame(self):
+        src = self.tmp / "clip.mp4"
+        make_clip(src, "30")
+        full, _, _ = self.run_extract(src, [(0.5, 4.5)], 1, 120, "all")
+        for step in (2, 5, 7):
+            for workers in (1, 4):
+                with self.subTest(step=step, workers=workers):
+                    got, _, _ = self.run_extract(
+                        src, [(0.5, 4.5)], workers, 120, f"s{step}", step)
+                    self.assertEqual(ms(got), ms(full)[::step])
+                    self.assertEqual([f.index for f in got], list(range(len(got))))
+                    self.assertTrue(all(f.path.exists() and f.thumb.exists()
+                                        for f in got))
+
+    def test_local_info_and_source_bypasses_download(self):
+        src = self.tmp / "local clip.mp4"
+        make_clip(src, "24", seconds=2)
+        info = backend.fetch_local_info(src)
+        self.assertEqual(info.path, src.resolve())
+        self.assertEqual(info.title, "local clip")
+        self.assertEqual(info.width, 320)
+        self.assertEqual(info.height, 180)
+        self.assertAlmostEqual(info.fps, 24)
+        self.assertEqual(backend.ensure_downloaded(
+            info, lambda *_: None, threading.Event()), src.resolve())
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import lru_cache
+from fractions import Fraction
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Callable, Optional
@@ -114,6 +116,43 @@ def fetch_info(url: str) -> VideoInfo:
     )
 
 
+def fetch_local_info(path: Path) -> VideoInfo:
+    """Read video metadata from a local file with ffprobe."""
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"Video file not found: {path}")
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate,codec_name:"
+         "format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode:
+        detail = result.stderr.strip().splitlines()
+        raise RuntimeError("ffprobe failed: " + (detail[-1] if detail else "unknown error"))
+    try:
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        duration = float(data.get("format", {}).get("duration") or 0)
+        fps = float(Fraction(stream.get("r_frame_rate") or "0"))
+        file_id = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:10]
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as e:
+        raise RuntimeError(f"Couldn't read video metadata from {path.name}") from e
+    return VideoInfo(
+        url=str(path),
+        id=f"local-{file_id}",
+        title=path.stem,
+        duration=duration,
+        width=int(stream.get("width") or 0),
+        height=int(stream.get("height") or 0),
+        fps=fps,
+        vcodec=stream.get("codec_name") or "?",
+        format_id="local",
+        est_frames=round(fps * duration) if fps and duration else 0,
+        path=path,
+    )
+
+
 def _find_cached(info: VideoInfo) -> Optional[Path]:
     for p in CACHE_DIR.glob(f"{info.id}.{info.format_id}.*"):
         if not any(x in p.name for x in (".part", ".ytdl", ".temp")):
@@ -136,6 +175,14 @@ def count_frames(path: Path) -> Optional[int]:
 def ensure_downloaded(info: VideoInfo, progress: Progress,
                       cancel: threading.Event) -> Path:
     """Download the video-only stream into cache/ (reused on later runs)."""
+    if info.path is not None:
+        if not info.path.is_file():
+            raise ValueError(f"Video file not found: {info.path}")
+        if info.exact_frames is None:
+            progress(None, "Counting frames...")
+            info.exact_frames = count_frames(info.path)
+        return info.path
+
     import yt_dlp
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -212,9 +259,15 @@ def _safe_name(s: str, limit: int = 80) -> str:
     return s[:limit].rstrip(" .") or "video"
 
 
-def make_output_dir(info: VideoInfo, start: float, end: float) -> Path:
+def _step_tag(step: int) -> str:
+    return f"_every{step}" if step > 1 else ""
+
+
+def make_output_dir(info: VideoInfo, start: float, end: float,
+                    step: int = 1) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    base = f"{_safe_name(info.title)} [{info.id}]_{start:.3f}-{end:.3f}"
+    base = (f"{_safe_name(info.title)} [{info.id}]_{start:.3f}-{end:.3f}"
+            f"{_step_tag(step)}")
     d, n = OUTPUT_DIR / base, 2
     while d.exists():
         d = OUTPUT_DIR / f"{base} ({n})"
@@ -222,10 +275,11 @@ def make_output_dir(info: VideoInfo, start: float, end: float) -> Path:
     return d
 
 
-def make_multi_output_dir(info: VideoInfo) -> Path:
+def make_multi_output_dir(info: VideoInfo, step: int = 1) -> Path:
     """Create a distinct output directory for an extraction with many ranges."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    base = f"{_safe_name(info.title)} [{info.id}]_multiple-ranges"
+    base = (f"{_safe_name(info.title)} [{info.id}]_multiple-ranges"
+            f"{_step_tag(step)}")
     d, n = OUTPUT_DIR / base, 2
     while d.exists():
         d = OUTPUT_DIR / f"{base} ({n})"
@@ -257,7 +311,7 @@ class _Job:
 
 
 def _plan_jobs(ranges: list[tuple[float, float]], expected: int, workers: int,
-               png_root: Path, thumb_root: Path) -> list[_Job]:
+               png_root: Path, thumb_root: Path, step: int = 1) -> list[_Job]:
     """Cut the ranges into slices so every worker has something to do.
 
     PNG encoding is single-threaded inside one ffmpeg process, so a single
@@ -266,7 +320,8 @@ def _plan_jobs(ranges: list[tuple[float, float]], expected: int, workers: int,
     cost. If the frame rate is unknown (expected == 0) ranges aren't split.
     """
     total_dur = sum(e - s for s, e in ranges) or 1.0
-    target = max(MIN_CHUNK_FRAMES, -(-expected // workers)) if expected else 0
+    target = (max(MIN_CHUNK_FRAMES, -(-expected // workers))
+              if expected and step == 1 else 0)
     jobs: list[_Job] = []
     for ri, (s, e) in enumerate(ranges):
         s_ms, e_ms = round(s * 1000), round(e * 1000)
@@ -283,11 +338,14 @@ def _plan_jobs(ranges: list[tuple[float, float]], expected: int, workers: int,
     return jobs
 
 
-def _ffmpeg_cmd(src: Path, job: _Job, decoder_threads: int) -> list[str]:
+def _ffmpeg_cmd(src: Path, job: _Job, decoder_threads: int,
+                step: int = 1) -> list[str]:
     scale = (f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease"
              ":force_divisible_by=2:flags=area")
     mode = list(_fps_mode_args())
     pre = ["-threads", str(decoder_threads)] if decoder_threads else []
+    png_vf = ["-vf", f"framestep={step}"] if step > 1 else []
+    pick = f"framestep={step}," if step > 1 else ""
     return [
         "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info", "-y",
         # -ss before -i: fast seek, then ffmpeg decodes up to the exact frame
@@ -295,18 +353,20 @@ def _ffmpeg_cmd(src: Path, job: _Job, decoder_threads: int) -> list[str]:
         "-t", f"{(job.end_ms - job.start_ms) / 1000:.3f}", "-i", str(src),
         # output 1: full-res PNGs
         "-map", "0:v:0", "-an", "-sn", *mode, "-start_number", "0",
+        *png_vf,
         "-compression_level", str(PNG_COMPRESSION),
         str(job.png_dir / "%06d.png"),
-        # output 2: thumbnails (showinfo prints one line per frame)
+        # output 2: thumbnails (showinfo after framestep = one line per kept frame)
         "-map", "0:v:0", "-an", "-sn", *mode, "-start_number", "0",
-        "-vf", f"showinfo,{scale}", "-q:v", "4", str(job.thumb_dir / "%06d.jpg"),
+        "-vf", f"{pick}showinfo,{scale}", "-q:v", "4",
+        str(job.thumb_dir / "%06d.jpg"),
     ]
 
 
 def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
                    thumb_dir: Path, expected: int, progress: Progress,
                    cancel: threading.Event,
-                   workers: Optional[int] = None) -> list[Frame]:
+                   workers: Optional[int] = None, step: int = 1) -> list[Frame]:
     """Decode every frame with timestamp in [start, end) for each range.
 
     Ranges (and big ranges, split into slices) are decoded by several ffmpeg
@@ -316,9 +376,10 @@ def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
     timestamp, so variable-frame-rate videos are labelled correctly.
     """
     workers = workers or _worker_count()
+    step = max(1, int(step))
     out_dir.mkdir(parents=True, exist_ok=True)
     thumb_dir.mkdir(parents=True, exist_ok=True)
-    jobs = _plan_jobs(ranges, expected, workers, out_dir, thumb_dir)
+    jobs = _plan_jobs(ranges, expected, workers, out_dir, thumb_dir, step)
     pool_size = min(workers, len(jobs))
     # don't let N processes each spawn a full set of decoder threads
     decoder_threads = max(1, (os.cpu_count() or 1) // pool_size) if pool_size > 1 else 0
@@ -328,16 +389,17 @@ def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
     procs: set[subprocess.Popen] = set()
     done = [0]
     last_report = [0.0]
+    shown = -(-expected // step) if expected else 0
 
     def report(force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - last_report[0] < 0.05:   # <= 20 updates/s
             return
         last_report[0] = now
-        frac = min(done[0] / expected, 1.0) if expected else None
+        frac = min(done[0] / shown, 1.0) if shown else None
         who = f" ({pool_size} workers)" if pool_size > 1 else ""
         progress(frac, f"Extracting frames... {done[0]}"
-                       + (f" / ~{expected}" if expected else "") + who)
+                       + (f" / ~{shown}" if shown else "") + who)
 
     def run(job: _Job) -> None:
         if abort.is_set():
@@ -345,12 +407,12 @@ def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
         job.png_dir.mkdir(parents=True, exist_ok=True)
         job.thumb_dir.mkdir(parents=True, exist_ok=True)
         proc = subprocess.Popen(
-            _ffmpeg_cmd(src, job, decoder_threads), stdout=subprocess.DEVNULL,
+            _ffmpeg_cmd(src, job, decoder_threads, step), stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         with lock:
             procs.add(proc)
         times: list[Optional[float]] = []
-        tail: deque[str] = deque(maxlen=6)
+        tail: deque[str] = deque(maxlen=8)
         try:
             for line in proc.stderr:
                 m = _SHOWINFO.search(line)
@@ -359,7 +421,7 @@ def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
                     with lock:
                         done[0] += 1
                         report()
-                elif line.strip():
+                elif line.strip() and "Parsed_showinfo" not in line:
                     tail.append(line.rstrip())
             rc = proc.wait()
         except BaseException:
@@ -373,7 +435,7 @@ def extract_ranges(src: Path, ranges: list[tuple[float, float]], out_dir: Path,
         if abort.is_set():
             raise Cancelled()
         if rc != 0:
-            raise RuntimeError("ffmpeg failed: " + " | ".join(tail))
+            raise RuntimeError(f"ffmpeg exited with code {rc}: " + " | ".join(tail))
         job.times = times
 
     def cleanup() -> None:
@@ -456,10 +518,10 @@ def _assemble(jobs: list[_Job], out_dir: Path, thumb_dir: Path) -> list[Frame]:
 def extract_frames(src: Path, start: float, end: float, out_dir: Path,
                    thumb_dir: Path, expected: int, progress: Progress,
                    cancel: threading.Event,
-                   workers: Optional[int] = None) -> list[Frame]:
+                   workers: Optional[int] = None, step: int = 1) -> list[Frame]:
     """Single-range convenience wrapper around extract_ranges."""
     return extract_ranges(src, [(start, end)], out_dir, thumb_dir, expected,
-                          progress, cancel, workers)
+                          progress, cancel, workers, step)
 
 
 def delete_frames(frames: list[Frame]) -> None:

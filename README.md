@@ -1,7 +1,7 @@
 # YT Frame Grabber
 
-Paste a YouTube link, type one or more time ranges, get **every frame** in those ranges as
-full-resolution PNGs. Pick which to keep in a simple grid.
+Paste a YouTube link, or choose a local video, then type one or more time ranges to get
+**every frame** in those ranges as full-resolution PNGs. Pick which to keep in a simple grid.
 
 ## Setup
 
@@ -13,11 +13,17 @@ Optionally pre-fill: `python main.py "https://youtu.be/XXXX" "1:27.250-1:28"`
 
 ## Usage
 
-1. Paste the link, press **Enter** (or **Fetch**). Shows the best available stream: resolution, fps, codec, duration, frame count.
+1. Paste the link, press **Enter** (or **Fetch**), or press **Choose video** to select a local file.
+   On Linux, the chooser runs separately so the main window remains responsive while it is open.
+   Shows resolution, fps, codec, duration, and frame count.
 2. Type one or more ranges and press **Enter** (or **Extract**). Separate ranges
    with commas, semicolons, or new lines. Anything works down to the millisecond:
+   `*` extracts the whole video.
    `87-88` · `87.5-88.25` · `1:27-1:28` · `1:27.250-1:28` ·
    `87-88, 100-101` · `0:01:27.250 to 0:01:28`
+   Set **Every N frames** to keep only every Nth frame (1 = all). Counting starts at
+   the first frame of each range. Output goes to a folder ending in `_everyN`, and
+   `#` in the grid is the index within the output, not the source frame number.
 3. Frames appear in a grid.
 
 | Action | How |
@@ -39,9 +45,11 @@ Output goes to `output/<Video Title> [id]_<start>-<end>/` for one range, or a
 
 ## Notes
 
-- The best **video-only** stream is downloaded once into `cache/` and reused for any
+- For YouTube, the best **video-only** stream is downloaded once into `cache/` and reused for any
   further ranges on the same video. Delete `cache/` to reclaim space.
+- Local videos are read directly from their original file and are not copied into `cache/`.
 - The range is `[start, end)`: a frame exactly at the end timestamp is not included.
+- When **Every N frames** is greater than 1, ranges are not split across workers.
 - Frames are decoded straight from the original stream (no re-encode), and timestamps
   come from ffmpeg itself, so variable-frame-rate videos are labelled correctly.
 - Large ranges at 4K = lots of big PNGs (see [Performance](#performance-and-large-ranges)).

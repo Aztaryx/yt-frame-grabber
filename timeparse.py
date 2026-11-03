@@ -5,6 +5,7 @@ Accepted timestamps (all down to the millisecond and beyond):
     1:27      1:27.250    0:01:27.250
 Accepted range separators:  -   –   —   to
     87-88    1:27.250-1:28    87.5 to 88.25
+    *         (the whole video)
 Multiple ranges can be separated with commas, semicolons, or newlines.
 """
 from __future__ import annotations
@@ -14,6 +15,16 @@ import re
 
 class TimeParseError(ValueError):
     pass
+
+
+def parse_step(text: str) -> int:
+    """'' -> 1 (every frame); '5' -> every 5th frame."""
+    s = text.strip()
+    if not s:
+        return 1
+    if not (s.isascii() and s.isdigit()) or int(s) < 1:
+        raise TimeParseError("'Every' must be a whole number of frames, like 1 or 5")
+    return int(s)
 
 
 _NUM = re.compile(r"^(?:\d+(?:\.\d*)?|\.\d+)$")
@@ -43,6 +54,8 @@ def parse_time(text: str) -> float:
 
 
 def parse_range(text: str) -> tuple[float, float]:
+    if text.strip() == "*":
+        return 0.0, float("inf")
     parts = _RANGE_SEP.split(text.strip())
     if len(parts) != 2:
         raise TimeParseError("Use a range like 87-88.5 or 1:27.250-1:28")
